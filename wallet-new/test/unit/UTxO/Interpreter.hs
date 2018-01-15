@@ -11,7 +11,8 @@ import Universum
 import Pos.Core hiding (Block)
 import Pos.Crypto
 
-import UTxO.Simplified (Simplified(..), Translate)
+import UTxO.Simplified (Simplified(..))
+import UTxO.Translate
 import qualified UTxO            as DSL
 import qualified UTxO.Simplified as Simpl
 
@@ -21,10 +22,12 @@ import qualified UTxO.Simplified as Simpl
 
 type Addr = Simpl Address
 
+-- | A block of transactions
+--
+-- The block must be signed by the slot leader for the given slot.
 data Block = Block {
       blockPrev  :: Maybe Block
     , blockSId   :: SlotId
-    , blockKey   :: SecretKey -- TODO: Should probably be "rich actor"
     , blockTrans :: [DSL.Transaction Addr]
     }
 
@@ -32,6 +35,9 @@ data Block = Block {
   Translate from the DSL to Core types
 
   This goes through the 'Simplified' core module as an intermediate step.
+
+  TODO: Remove intermediate types. They are now isomorphic to the
+  'Simplified' ones.
 -------------------------------------------------------------------------------}
 
 class Interpret a where
@@ -77,6 +83,5 @@ instance Interpret Block where
   int Block{..} = Simpl.Block {
         blockPrev  = int <$> blockPrev
       , blockSId   = blockSId
-      , blockKey   = blockKey
       , blockTrans = map int blockTrans
       }

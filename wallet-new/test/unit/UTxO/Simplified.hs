@@ -7,27 +7,24 @@ module UTxO.Simplified (
   , Simpl(..)
     -- * Genesis data
   , genesisBlock0
+  , genesisLeaders
+  , genesisStakes
+  , genesisBalances
+    -- * Derived data
   , generatedActors
   , Actors(..)
   , Rich(..)
   , Poor(..)
-    -- * Translation context
-  , Translate
-  , runTranslate
-  , lift
-  , liftPure
-  , liftMaybe
   ) where
 
 import Universum hiding (lift)
-import Control.Exception (throw)
-import Control.Monad.Except (MonadError)
 import Data.Default (def)
 import Data.List ((!!))
-import System.IO.Error (userError)
 import Formatting (bprint, build, (%))
 import Serokell.Util (listJson, pairF)
-import qualified Data.List.NonEmpty as NE
+import qualified Data.HashMap.Strict as HM
+import qualified Data.List.NonEmpty  as NE
+import qualified Data.Map.Strict     as Map
 import qualified Data.Text.Buildable
 
 import Pos.Block.Logic
@@ -35,21 +32,12 @@ import Pos.Client.Txp
 import Pos.Core hiding (genesisData, generatedSecrets)
 import Pos.Crypto
 import Pos.Ssc
-import Pos.Update
-import qualified Pos.Context
-import qualified Pos.Core
+import Pos.Txp (utxoToAddressCoinPairs)
+import qualified Pos.Context     as Cardano
+import qualified Pos.Core        as Cardano
+import qualified Pos.Lrc.Genesis as Cardano
 
-{-------------------------------------------------------------------------------
-  Testing infrastructure from cardano-sl-core
-
-  The genesis block comes from defaultTestConf, which in turn uses
-  configuration.yaml. It is specified by a 'GenesisSpec'.
--------------------------------------------------------------------------------}
-
-import Test.Pos.Util (
-    withDefConfiguration
-  , withDefUpdateConfiguration
-  )
+import UTxO.Translate
 
 {-------------------------------------------------------------------------------
   Simplified API for block construction
@@ -117,6 +105,7 @@ instance Simplified TxAux where
     , trOuts :: [Simpl TxOutAux]
     }
 
+  -- TODO: Can we avoid FakeSigner here?
   fromSimpl :: Simpl TxAux -> Translate TxAux
   fromSimpl Transaction{..} = do
       trIns'  <- mapM fromSimpl trIns
@@ -135,15 +124,10 @@ instance Simplified TxAux where
 -- * We stay within a single epoch for now
 -- * We use the genesis block from the test configuration
 --   (which has implications for which slot leaders etc we have)
---
--- TODO: Figure out what the test dev is, precisely. It says that it uses
--- HD addresses, but in which way? (cf. 'mkGenesisBlock', 'genesisLeaders',
--- 'genesisBlock0').
 instance Simplified MainBlock where
   data Simpl MainBlock = Block {
       blockPrev  :: Maybe (Simpl MainBlock)
     , blockSId   :: SlotId
-    , blockKey   :: SecretKey
     , blockTrans :: [Simpl TxAux]
     }
 
@@ -164,6 +148,9 @@ instance Simplified MainBlock where
             Just block -> (Right . view gbHeader) <$> fromSimpl block
             Nothing    -> (Left  . view gbHeader) <$> genesisBlock0
 
+        -- get block key from the slot leader
+        blockKey <- getBlockKey blockSId
+
         lift $ createMainBlockPure
           blockSizeLimit
           prev
@@ -180,30 +167,161 @@ instance Simplified MainBlock where
       blockSizeLimit = 1 * 1024 * 1024 -- 1 MB
 
 {-------------------------------------------------------------------------------
-  Genesis data
-
-  See also:
-
-  * 'generateGenesisData'
+  Extract bits of data from HasConfiguration
 -------------------------------------------------------------------------------}
 
 genesisBlock0 :: Translate GenesisBlock
-genesisBlock0 = liftPure Pos.Context.genesisBlock0
+genesisBlock0 = liftPure Cardano.genesisBlock0
+
+genesisLeaders :: Translate SlotLeaders
+genesisLeaders = liftPure Cardano.genesisLeaders
+
+genesisStakes :: Translate StakesMap
+genesisStakes = liftPure Cardano.genesisStakes
+
+genesisBalances :: Translate [(Address, Coin)]
+genesisBalances = utxoToAddressCoinPairs . Cardano.unGenesisUtxo
+              <$> liftPure Cardano.genesisUtxo
+
+{-------------------------------------------------------------------------------
+  Genesis data
+
+  When heavy-weight delegation is enabled, 'generateGenesisData' creates three
+  sets of actors, each with their own set of secret keys:
+
+  * The 'poor' actors, with a small balance ('gsPoorSecrets')
+    (these use HD addresses)
+  * The 'rich' actors, with a large balance ('gsRichSecrets')
+    (these do not use HD addresses)
+  * The stakeholders ('gsDlgIssuersSecrets')
+    (no addresses get generated for these)
+
+  (Using the Ouroboros-neutral word "actor" intentionally to avoid confusion.)
+
+  All addresses (for the poor and rich actors) use 'BootstrapEraDistr' as their
+  stake distribution attribute; in 'bootstrapEraDistr' this is interpreted as
+  a distribution over the 'gdBootStakeholders' in the genesis data, which in
+  turn is derived from 'gsDlgIssuersSecrets' in 'generateGenesisData'.
+
+  Additionally, 'generateGenesisData' generates a set of 'ProxySKHeavy' (aka
+  'ProxySecretKey EpochIndex') delegating from the stakeholders (the
+  'pskIssuerPk') to the rich actors (the 'pskDelegatePk'). The following excerpt
+  from Section 8.2, Delegation Schema, of the Ouroboros paper is relevant here:
+
+  > A stakeholder can transfer the right to generate blocks by creating a proxy
+  > signing key that allows the delegate to sign messages of the form (st, d,
+  > slj) (i.e., the format of messages signed in Protocol πDPoS to authenticate
+  > a block).
+
+  So it's actually the rich actors that sign blocks on behalf of the
+  stakeholders.
+
+  The genesis UTxO computed by 'genesisUtxo', being a Utxo, is simply a set of
+  unspent transaction outputs; 'genesisStakes' then uses 'utxoToStakes' to turn
+  this into a 'StakeMap'. A key component of this transaction is 'txOutStake',
+  which relies on 'bootstrapEtaDistr' for addresses marked 'BootstrapEraDistr'.
+  Thus the 'StakesMap' computed by 'genesisStakes' will contain 'StakeholderId's
+  of the stakeholders, even though (somewhat confusingly) the stakeholders are
+  never actually assigned any addresses.
+
+  Finally, 'genesisLeaders' uses 'followTheSatoshiUtxo' applied to the
+  'genesisUtxo' to compute the 'SlotLeaders' (aka 'NonEmpty StakeholderId').
+  Since the stake holders have delegated their signing privilege to the rich
+  actors, however, it is actually the rich actors that sign the blocks. The
+  mapping from the (public keys) of the stakeholders to the (public keys) of the
+  rich actors is recorded in 'gdHeavyDelegation' of 'GenesisData'.
+
+  Concretely, the generated genesis data looks something like this:
+
+  > { actors: Actors{
+  >       rich: [
+  >           Rich{ key: sec:R1S, addr: R1A}
+  >         , Rich{ key: sec:R2S, addr: R2A}
+  >         , Rich{ key: sec:R3S, addr: R3A}
+  >         , Rich{ key: sec:R4S, addr: R4A}
+  >         ]
+  >     , poor: [
+  >           Poor{ key: sec:P1S, addrs: [(sec:P11S, P11A)]}
+  >         , Poor{ key: sec:P2S, addrs: [(sec:P21S, P21A)]}
+  >         , Poor{ key: sec:P3S, addrs: [(sec:P31S, P31A)]}
+  >         , Poor{ key: sec:P4S, addrs: [(sec:P41S, P41A)]}
+  >         , Poor{ key: sec:P5S, addrs: [(sec:P51S, P51A)]}
+  >         , Poor{ key: sec:P6S, addrs: [(sec:P61S, P61A)]}
+  >         , Poor{ key: sec:P7S, addrs: [(sec:P71S, P71A)]}
+  >         , Poor{ key: sec:P8S, addrs: [(sec:P81S, P81A)]}
+  >         , Poor{ key: sec:P9S, addrs: [(sec:P91S, P91A)]}
+  >         , Poor{ key: sec:P10S, addrs: [(sec:P101S, P101A)]}
+  >         , Poor{ key: sec:P11S, addrs: [(sec:P111S, P111A)]}
+  >         , Poor{ key: sec:P12S, addrs: [(sec:P121S, P121A)]}
+  >         ]
+  >     , stake: [
+  >           Stakeholder{ id: S1Id, key: sec:S1S, del: Rich{ key: sec:R4S, addr: R4A}}
+  >         , Stakeholder{ id: S2Id, key: sec:S2S, del: Rich{ key: sec:R2S, addr: R2A}}
+  >         , Stakeholder{ id: S3Id, key: sec:S3S, del: Rich{ key: sec:R1S, addr: R1A}}
+  >         , Stakeholder{ id: S4Id, key: sec:S4S, del: Rich{ key: sec:R3S, addr: R3A}}
+  >         ]
+  >     }
+  > , leaders: [S1Id, S2Id, S3Id, S3Id, S1Id, S4Id, ...]
+  > , stakes: [
+  >       (S1Id, 11249999999999992 coin(s))
+  >     , (S3Id, 11250000000000016 coin(s))
+  >     , (S4Id, 11249999999999992 coin(s))
+  >     , (S2Id, 11249999999999992 coin(s))
+  >   ]
+  > , balances: [
+  >       (R1A,   11137499999752500 coin(s))
+  >     , (R2A,   11137499999752500 coin(s))
+  >     , (R3A,   11137499999752500 coin(s))
+  >     , (R4A,   11137499999752500 coin(s))
+  >     , (P11A,     37499999999166 coin(s))
+  >     , (P21A,     37499999999166 coin(s))
+  >     , (P31A,     37499999999166 coin(s))
+  >     , (P41A,     37499999999166 coin(s))
+  >     , (P51A,     37499999999166 coin(s))
+  >     , (P61A,     37499999999166 coin(s))
+  >     , (P71A,     37499999999166 coin(s))
+  >     , (P81A,     37499999999166 coin(s))
+  >     , (P91A,     37499999999166 coin(s))
+  >     , (P101A,    37499999999166 coin(s))
+  >     , (P111A,    37499999999166 coin(s))
+  >     , (P121A,    37499999999166 coin(s))
+  >     ]
+  > }
+
+  (where 'balances' also contains some "fake AVVM" balances, omitted.)
+-------------------------------------------------------------------------------}
+
+getBlockKey :: SlotId -> Translate SecretKey
+getBlockKey slotId = do
+    leader     <- (NE.!! slotIx) <$> genesisLeaders
+    Actors{..} <- generatedActors
+    return $ richKey $ stkDel (actorsStake Map.! leader)
+  where
+    slotIx :: Int
+    slotIx = fromIntegral $ getSlotIndex (siSlot slotId)
 
 generatedActors :: Translate Actors
 generatedActors = do
-     secrets <- liftMaybe "Generated secrets unavailable" Pos.Core.generatedSecrets
-     return Actors {
-         actorsRich = map mkRich (richKeys secrets)
-       , actorsPoor = map mkPoor (poorKeys secrets)
-       }
+     genData <- liftPure Cardano.genesisData
+     secrets <- liftMaybe "Generated secrets unavailable" Cardano.generatedSecrets
+
+     let actorsRich :: Map PublicKey Rich
+         actorsRich = Map.fromList
+                    $ map mkRich
+                    $ gsRichSecrets secrets
+
+         actorsPoor :: Map PublicKey Poor
+         actorsPoor = Map.fromList
+                    $ map mkPoor
+                    $ gsPoorSecrets secrets
+
+         actorsStake :: Map StakeholderId Stakeholder
+         actorsStake = Map.fromList
+                     $ map (mkStake (gdHeavyDelegation genData) actorsRich)
+                     $ gsDlgIssuersSecrets secrets
+
+     return Actors{..}
   where
-    richKeys :: GeneratedSecrets -> [SecretKey]
-    richKeys = map rsPrimaryKey . gsRichSecrets -- this just ignores Vss keys
-
-    poorKeys :: GeneratedSecrets -> [EncryptedSecretKey]
-    poorKeys = gsPoorSecrets
-
     -- TODO: This mapping from the secret keys to the corresponding addresses
     -- is already present in generateGenesisData , but it is not returned.
     -- I see no choice currently but to recompute it. This is unfortunate
@@ -211,24 +329,47 @@ generatedActors = do
     -- out of sync here. Also, we're assuming here that 'tboUseHDAddresses'
     -- is true ('useHDAddresses' must be set to true in the config yaml file).
 
-    mkRich :: SecretKey -> Rich
-    mkRich sk = Rich {
-          richKey  = sk
-        , richAddr = makePubKeyAddressBoot (toPublic sk)
-        }
+    mkRich :: RichSecrets -> (PublicKey, Rich)
+    mkRich RichSecrets{..} =
+        (toPublic rsPrimaryKey, Rich {..})
+      where
+        richKey  = rsPrimaryKey
+        richAddr = makePubKeyAddressBoot (toPublic rsPrimaryKey)
 
-    mkPoor :: EncryptedSecretKey -> Poor
-    mkPoor sk = Poor {
-          poorKey   = sk
-        , poorAddrs = [ case deriveFirstHDAddress
-                               (IsBootstrapEraAddr True)
-                               emptyPassphrase
-                               sk of
-                          Nothing          -> error "impossible"
-                          Just (addr, key) -> (key, addr)
-                      ]
-        }
+    mkPoor :: EncryptedSecretKey -> (PublicKey, Poor)
+    mkPoor poorKey =
+        (encToPublic poorKey, Poor {..})
+      where
+        poorAddrs :: [(EncryptedSecretKey, Address)]
+        poorAddrs = [ case deriveFirstHDAddress
+                             (IsBootstrapEraAddr True)
+                             emptyPassphrase
+                             poorKey of
+                        Nothing          -> error "impossible"
+                        Just (addr, key) -> (key, addr)
+                    ]
 
+    mkStake :: GenesisDelegation
+            -> Map PublicKey Rich
+            -> SecretKey
+            -> (StakeholderId, Stakeholder)
+    mkStake del actorsRich stkKey =
+        (stkId, Stakeholder{..})
+      where
+        stkId :: StakeholderId
+        stkId = addressHash (toPublic stkKey)
+
+        stkDel :: Rich
+        stkDel = Map.findWithDefault
+                  (error ("delegate not found"))
+                  (pskDelegatePk psk)
+                  actorsRich
+
+        psk :: ProxySKHeavy
+        psk = HM.lookupDefault
+                (error ("issuer not found"))
+                stkId
+                (unGenesisDelegation del)
 
 -- | A rich actor has a key and a "simple" (non-HD) address
 data Rich = Rich {
@@ -247,309 +388,72 @@ data Poor = Poor {
     }
   deriving (Show)
 
+data Stakeholder = Stakeholder {
+      stkId  :: StakeholderId
+    , stkKey :: SecretKey
+    , stkDel :: Rich
+    }
+  deriving (Show)
+
 data Actors = Actors {
-      actorsRich :: [Rich]
-    , actorsPoor :: [Poor]
+      actorsRich  :: Map PublicKey Rich
+    , actorsPoor  :: Map PublicKey Poor
+    , actorsStake :: Map StakeholderId Stakeholder
     }
   deriving (Show)
 
 actorAddr :: Simpl Address -> Actors -> Address
-actorAddr (AddrRich i)   Actors{..} = richAddr (actorsRich !! i)
-actorAddr (AddrPoor i j) Actors{..} = snd (poorAddrs (actorsPoor !! i) !! j)
+actorAddr (AddrRich i)   Actors{..} = richAddr (Map.elems actorsRich !! i)
+actorAddr (AddrPoor i j) Actors{..} = snd (poorAddrs (Map.elems actorsPoor !! i) !! j)
 
 actorKey :: Simpl Address -> Actors -> SecretKey
-actorKey (AddrRich i)   Actors{..} = richKey (actorsRich !! i)
-actorKey (AddrPoor i j) Actors{..} = encToSecret (fst (poorAddrs (actorsPoor !! i) !! j))
+actorKey (AddrRich i)   Actors{..} = richKey (Map.elems actorsRich !! i)
+actorKey (AddrPoor i j) Actors{..} = encToSecret (fst (poorAddrs (Map.elems actorsPoor !! i) !! j))
 
 {-------------------------------------------------------------------------------
   Pretty-printing
 -------------------------------------------------------------------------------}
 
 instance Buildable Rich where
-  build Rich{..} = bprint ( "Rich {"
-                          % "key: " % build
-                          % ", addr: " % build
-                          % "}"
-                          )
-                          richKey
-                          richAddr
+  build Rich{..} = bprint
+      ( "Rich"
+      % "{ key: "  % build
+      % ", addr: " % build
+      % "}"
+      )
+      richKey
+      richAddr
 
 instance Buildable Poor where
-  build Poor{..} = bprint ( "Poor {"
-                          % "key: " % build
-                          % ", addrs: " % listJson
-                          % "}"
-                          )
-                          (encToSecret poorKey)
-                          (map (bprint pairF . first encToSecret) poorAddrs)
+  build Poor{..} = bprint
+      ( "Poor"
+      % "{ key: "   % build
+      % ", addrs: " % listJson
+      % "}"
+      )
+      (encToSecret poorKey)
+      (map (bprint pairF . first encToSecret) poorAddrs)
+
+instance Buildable Stakeholder where
+  build Stakeholder{..} = bprint
+      ( "Stakeholder"
+      % "{ id: "  % build
+      % ", key: " % build
+      % ", del: " % build
+      % "}"
+      )
+      stkId
+      stkKey
+      stkDel
 
 instance Buildable Actors where
-  build Actors{..} = bprint ( "Actors {"
-                            % "rich: " % listJson
-                            % " poor: " % listJson
-                            % "}"
-                            )
-                            actorsRich
-                            actorsPoor
-
-{-------------------------------------------------------------------------------
-  Translation context
--------------------------------------------------------------------------------}
-
-data Translate a = Translate {
-      unTranslate :: (HasConfiguration, HasUpdateConfiguration) => Either Text a
-    }
-
-instance Functor Translate where
-  fmap = liftM
-
-instance Applicative Translate where
-  pure  = return
-  (<*>) = ap
-
-instance Monad Translate where
-  return a = Translate $ Right a
-  x >>= f  = Translate $ case unTranslate x of
-                           Left err -> Left err
-                           Right a  -> unTranslate (f a)
-
-lift :: (forall m. (HasConfiguration, HasUpdateConfiguration, MonadError Text m) => m a)
-     -> Translate a
-lift act = Translate act
-
-liftPure :: ((HasConfiguration, HasUpdateConfiguration) => a) -> Translate a
-liftPure a = Translate (Right a)
-
-liftMaybe :: Text -> ((HasConfiguration, HasUpdateConfiguration) => Maybe a) -> Translate a
-liftMaybe err ma = Translate $ case ma of
-                                 Just a  -> Right a
-                                 Nothing -> Left err
-
-runTranslate :: Translate a -> a
-runTranslate (Translate act) =
-   withDefConfiguration $
-   withDefUpdateConfiguration $
-     case act of
-       Left  e -> throw (userError (show e))
-       Right a -> a
-
-{-------------------------------------------------------------------------------
-  BELOW THIS LINE IS JUST EXPERIMENTATION
--------------------------------------------------------------------------------}
-
-
-{-------------------------------------------------------------------------------
-  GenesisData
-
-encToSecret :: EncryptedSecretKey -> SecretKey
-encToSecret (EncryptedSecretKey sk _) = SecretKey sk
-
--- | Generate a public key using an encrypted secret key and passphrase
-encToPublic :: EncryptedSecretKey -> PublicKey
-encToPublic = toPublic . encToSecret
-
--- | Valuable secrets which can unlock genesis data.
-data GeneratedSecrets = GeneratedSecrets
-    { gsDlgIssuersSecrets :: ![SecretKey]
-    -- ^ Secret keys which issued heavyweight delegation certificates
-    -- in genesis data. If genesis heavyweight delegation isn't used,
-    -- this list is empty.
-    , gsRichSecrets       :: ![RichSecrets]
-    -- ^ All secrets of rich nodes.
-    , gsPoorSecrets       :: ![EncryptedSecretKey]
-    -- ^ Keys for HD addresses of poor nodes.
-    , gsFakeAvvmSeeds     :: ![ByteString]
-    -- ^ Fake avvm seeds.
-    }
-
-It makes sense that this wouldn't have any private keys, since normally the nodes
-wouldn't have those. But presumably they do get created someplace during testing?
-
-
-generateGenesisData
-    :: (HasCryptoConfiguration, HasGenesisBlockVersionData, HasProtocolConstants)
-    => GenesisInitializer
-    -> GenesisAvvmBalances
-    -> GeneratedGenesisData
-
-    , tboUseHDAddresses :: !Bool
-    -- ^ Whether generate plain addresses or with hd payload.
-
-
-data GenesisData = GenesisData
-    { gdBootStakeholders :: !GenesisWStakeholders
-    , gdHeavyDelegation  :: !GenesisDelegation
-    , gdStartTime        :: !Timestamp
-    , gdVssCerts         :: !GenesisVssCertificatesMap
-    , gdNonAvvmBalances  :: !GenesisNonAvvmBalances
-    , gdBlockVersionData :: !BlockVersionData
-    , gdProtocolConsts   :: !ProtocolConstants
-    , gdAvvmDistr        :: !GenesisAvvmBalances
-    , gdFtsSeed          :: !SharedSeed
-    } deriving (Show, Eq)
-
-newtype GenesisWStakeholders = GenesisWStakeholders
-    { getGenesisWStakeholders :: Map StakeholderId Word16
-    } deriving (Show, Eq, Monoid)
-
-newtype GenesisDelegation = UnsafeGenesisDelegation
-    { unGenesisDelegation :: HashMap StakeholderId ProxySKHeavy
-    } deriving (Show, Eq, Container, NontrivialContainer)
-
--- | Stakeholder identifier (stakeholders are identified by their public keys)
-type StakeholderId = AddressHash PublicKey
-
-
-
--------------------------------------------------------------------------------}
-
-{-------------------------------------------------------------------------------
-  Let's make sure we have access to the types we need
-
-  TODO: Look at Pos.Txp.GenesisUtxo
--------------------------------------------------------------------------------}
-
--- someBlunds :: [Blund] -- == (Block, Undo)
--- someBlunds = zip someBlocks someUndos
---
--- someBlocks :: [Core.Block]  -- Either GenesisBlock MainBlock
--- someBlocks = map Left someGenesisBlocks ++ map Right someMainBlocks
---
--- someUndos :: [Undo]
--- someUndos = []
---
--- someGenesisBlocks :: [GenesisBlock]
--- someGenesisBlocks = []
---
--- someMainBlocks :: [MainBlock] -- GenericBlock MainBlockchain
--- someMainBlocks = []
---
--- someGenericBlocks :: [GenericBlock a]
--- someGenericBlocks = []
-
-{-------------------------------------------------------------------------------
-  Address stuff..
-
--- | Hash wrapper with phantom type for more type-safety.
--- Made abstract in order to support different algorithms in
--- different situations
-newtype AbstractHash algo a = AbstractHash (Digest algo)
-    deriving (Show, Eq, Ord, ByteArray.ByteArrayAccess, Generic, NFData)
-
-type AddressHash = AbstractHash Blake2b_224
-
-newtype Address' = Address'
-    { unAddress' :: (AddrType, AddrSpendingData, Attributes AddrAttributes)
-    } deriving (Eq, Show, Generic, Typeable)
-
-\-- | 'Address' is where you can send coins.
-data Address = Address
-    { addrRoot       :: !(AddressHash Address')
-    -- ^ Root of imaginary pseudo Merkle tree stored in this address.
-    , addrAttributes :: !(Attributes AddrAttributes)
-    -- ^ Attributes associated with this address.
-    , addrType       :: !AddrType
-    -- ^ The type of this address. Should correspond to
-    -- 'AddrSpendingData', but it can't be checked statically, because
-    -- spending data is hashed.
-    } deriving (Eq, Ord, Generic, Typeable, Show)
-
--- | Type of an address. It corresponds to constructors of
--- 'AddrSpendingData'. It's separated, because 'Address' doesn't store
--- 'AddrSpendingData', but we want to know its type.
-data AddrType
-    = ATPubKey
-    | ATScript
-    | ATRedeem
-    | ATUnknown !Word8
-    deriving (Eq, Ord, Generic, Typeable, Show)
-
--- | Data which is bound to an address and must be revealed in order
--- to spend coins belonging to this address.
-data AddrSpendingData
-    = PubKeyASD !PublicKey
-    -- ^ Funds can be spent by revealing a 'PublicKey' and providing a
-    -- valid signature.
-    | ScriptASD !Script
-    -- ^ Funds can be spent by revealing a 'Script' and providing a
-    -- redeemer 'Script'.
-    | RedeemASD !RedeemPublicKey
-    -- ^ Funds can be spent by revealing a 'RedeemScript' and providing a
-    -- valid signature.
-    | UnknownASD !Word8 !ByteString
-    -- ^ Unknown type of spending data. It consists of a tag and
-    -- arbitrary 'ByteString'. It allows us to introduce a new type of
-    -- spending data via softfork.
-    deriving (Eq, Generic, Typeable, Show)
-
--- | Convenient wrapper for the datatype to represent it (in binary
--- format) as k-v map.
-data Attributes h = Attributes
-    { -- | Data, containing known keys (deserialized)
-      attrData   :: h
-      -- | Remaining, unparsed fields.
-    , attrRemain :: UnparsedFields
-    } deriving (Eq, Ord, Generic, Typeable)
-
--- | Additional information stored along with address. It's intended
--- to be put into 'Attributes' data type to make it extensible with
--- softfork.
-data AddrAttributes = AddrAttributes
-    { aaPkDerivationPath  :: !(Maybe HDAddressPayload)
-    , aaStakeDistribution :: !AddrStakeDistribution
-    } deriving (Eq, Ord, Show, Generic, Typeable)
-
--- | Stake distribution associated with an address.
-data AddrStakeDistribution
-    = BootstrapEraDistr
-    -- ^ Stake distribution for bootstrap era.
-    | SingleKeyDistr !StakeholderId
-    -- ^ Stake distribution stating that all stake should go to the given stakeholder.
-    | UnsafeMultiKeyDistr !(Map StakeholderId CoinPortion)
-    -- ^ Stake distribution which gives stake to multiple
-    -- stakeholders. 'CoinPortion' is a portion of an output (output
-    -- has a value, portion of this value is stake). The constructor
-    -- is unsafe because there are some predicates which must hold:
-    --
-    -- • the sum of portions must be @maxBound@ (basically 1);
-    -- • all portions must be positive;
-    -- • there must be at least 2 items, because if there is only one item,
-    -- 'SingleKeyDistr' can be used instead (which is smaller).
-    deriving (Eq, Ord, Show, Generic, Typeable)
-
--- | HDAddressPayload consists of
---
--- * serialiazed and encrypted using HDPassphrase derivation path from the
--- root key to given descendant key (using ChaChaPoly1305 algorithm)
---
--- * cryptographic tag
---
--- For more information see 'packHDAddressAttr' and 'encryptChaChaPoly'.
-data HDAddressPayload
-    = HDAddressPayload
-    { getHDAddressPayload :: !ByteString
-    } deriving (Eq, Ord, Show, Generic)
-
--- | Serialize tree path and encrypt it using HDPassphrase via ChaChaPoly1305.
-packHDAddressAttr :: HDPassphrase -> [Word32] -> HDAddressPayload
-packHDAddressAttr (HDPassphrase passphrase) path =  ... ecrnyptChaChaPoly ..
-
--- | Passphrase is a hash of root public key.
-data HDPassphrase = HDPassphrase !ByteString
-    deriving Show
-
-deriveHDPassphrase :: PublicKey -> HDPassphrase
-
--- | Derive child's secret key from parent's secret key using user's passphrase.
-deriveHDSecretKey
-    :: (Bi PassPhrase, Bi EncryptedPass)
-    => ShouldCheckPassphrase
-    -> PassPhrase
-    -> EncryptedSecretKey
-    -> Word32
-    -> Maybe EncryptedSecretKey
-
--------------------------------------------------------------------------------}
-
---mkAddress :: Address
---mkAddress = undefined
+  build Actors{..} = bprint
+      ( "Actors"
+      % "{ rich: "  % listJson
+      % ", poor: "  % listJson
+      % ", stake: " % listJson
+      % "}"
+      )
+      (Map.elems actorsRich)
+      (Map.elems actorsPoor)
+      (Map.elems actorsStake)
